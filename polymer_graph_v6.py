@@ -1,0 +1,1081 @@
+#!/usr/bin/env python3
+"""
+polymer_graph_v6.py – layout-aware & interactive, with color & shape overrides
+=============================================================================
+Create and visualize a monomer–monomer connectivity graph from a polymer (MOL/
+SDF file or SMILES string).
+
+### Options added on 2025‑06‑22
+* --color NAME COLOR` – override node color (Matplotlib spec)
+* --shape NAME SHAPE` – override node shape (`circle|square|triangle|diamond`)
+
+bash
+python polymer_graph_v2.py --polymer_mol poly.mol \
+  --smiles A "C1=CC=CC=C1" \
+  --smiles B "OCCO" \
+  --color A "#e41a1c" \
+  --color B "#377eb8" \
+  --shape A square \
+  --shape B triangle \
+  --layout kk \
+  -o graph.png \
+  --interactive graph.html
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+from rdkit import Chem
+from collections import Counter, defaultdict
+
+
+
+# ============================================================================
+# Polymer loader
+# ============================================================================
+
+
+def _load_polymer(arg: str) -> Chem.Mol:
+    """
+    Return RDKit Mol from file or SMILES string.
+
+    Parameters
+    ----------
+    arg : str
+        MOL file path of full reacted polymer
+    
+    Returns
+    -------
+    mol : Chem.Mol
+        Mol object in which the full reacted polymer/network 
+        structure is represented
+    """
+    p = Path(arg)
+    if p.exists():
+        mol = Chem.MolFromMolFile(str(p), removeHs=False, sanitize=False)
+        Chem.SanitizeMol(mol)
+        if mol is None:
+            raise ValueError(f"Could not read MOL file '{p}'.")
+        return Chem.AddHs(mol)
+    
+    mol = Chem.MolFromSmiles(arg, sanitize=True)
+    if mol is None:
+        raise ValueError("Argument must be an existing file or a valid SMILES string.")
+    
+    return Chem.AddHs(mol)
+
+
+# ============================================================================
+# Monomer detection & graph building
+# ============================================================================
+
+
+def enumerate_monomers(
+    mol: Chem.Mol,
+    patterns: Dict[str, str],
+    allow_overlaps: bool = False,
+) -> Tuple[Dict[int, int], Dict[int, str]]:
+    """
+    Identify monomer units inside *mol* and give each a unique ID.
+
+    Parameters
+    ----------
+    mol : Chem.Mol
+        The full reacted polymer/network structure.
+    patterns : dict[str, str]
+        Mapping **monomer_name → SMARTS/SMILES** that represents **one repeat
+        unit**.  Each pattern is searched across *mol* in the order given.
+    allow_overlaps : bool, default False
+        If *False* (default) a given atom can belong to **only one** monomer;
+        any pattern hit sharing atoms with an already‑assigned monomer is
+        skipped.  If *True* overlapping matches are permitted.
+
+    Returns
+    -------
+    atom2mono : dict[int, int]
+        Atom index → monomer ID assigned by this function.
+    mono_label : dict[int, str]
+        Monomer ID → monomer name (as supplied in *patterns*).
+    """
+    
+    atom2mono: Dict[int, int] = {} 
+        # atom index → monomer ID already assigned
+    mono_label: Dict[int, str] = {}   
+        # monomer ID → human‑readable label
+    mid = 0  
+        # sequential monomer ID counter
+
+    for label, smiles in patterns.items():
+        q = Chem.MolFromSmiles(smiles, sanitize = False)
+        Chem.SanitizeMol(q)
+        if q is None:
+            raise ValueError(f"Invalid SMARTS for {label}: {smiles}")
+
+        # *match* = tuple of atom indices matched by this pattern
+        for match in mol.GetSubstructMatches(q, uniquify=True):
+            # Overlap guard: skip if any atom is already in another monomer
+            if not allow_overlaps and any(i in atom2mono for i in match):
+                # Expanded form for clarity:
+                # overlap = False
+                # for i in match:
+                #     if i in atom2mono:
+                #         overlap = True
+                #         break
+                # if overlap:
+                #     continue
+                continue
+
+            mid += 1  # issue new monomer ID
+            for i in match:
+                atom2mono[i] = mid
+            mono_label[mid] = label
+
+
+    return atom2mono, mono_label
+
+
+def build_graph(
+    mol: Chem.Mol, 
+    atom2mono: Dict[int, int], 
+    mono_label: Dict[int, str]
+) -> nx.Graph:
+    
+    """
+    Convert an RDKit *mol* into a monomer‑level connectivity graph (NetworkX).
+
+    Parameters
+    ----------
+    mol : Chem.Mol
+        The full polymer/oligomer molecule containing all atoms and bonds.
+    atom2mono : dict[int, int]
+        Mapping **atom index → monomer ID** generated by *enumerate_monomers()*.
+    mono_label : dict[int, str]
+        Mapping **monomer ID → monomer name/label** for human‑readable types.
+
+    Returns
+    -------
+    nx.Graph
+        Undirected graph where:
+        * **nodes** represent *monomer units* (1 node per monomer ID)
+        * **edges** represent *chemical bonds* between two different monomers.
+    """
+
+    G = nx.Graph()
+    for mid, label in mono_label.items():
+        G.add_node(mid, monomer_type=label)
+
+    for bond in mol.GetBonds():
+        # Get the atom indices at both ends of the current bond.
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+
+        # Look up which monomer each atom belongs to 
+        ma, mb = atom2mono.get(a), atom2mono.get(b)
+
+        # Check that both atoms are in monomers and that they belong to different monomers.
+        if ma is not None and mb is not None and ma != mb:
+            G.add_edge(ma, mb)
+
+    return G
+# ============================================================================
+
+
+
+# ============================================================================
+# Layout helper
+# ============================================================================
+# Calculates 2‑D node coordinates for the monomer graph so that drawing functions
+# can render a neat, non‑overlapping picture.  The caller only specifies the
+# algorithm name ("spring" or "kk") and optional parameters; this function does
+# the rest.
+# -----------------------------------------------------------------------------
+
+
+def _compute_layout(
+    G: nx.Graph,
+    layout: str,
+    k: float,
+    iterations: int,
+):
+    """Return a node‑position dictionary for *G*.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Monomer‑level connectivity graph.
+    layout : {"spring", "kk"}
+        Layout algorithm selector.
+        * **"spring"** → Fruchterman‑Reingold force‑directed layout.  
+          `k` (spring length) and `iterations` are forwarded.
+        * **"kk"** → Kamada‑Kawai layout.
+    k : float
+        Natural spring length for the spring layout.  If 0, a heuristic value
+        proportional to `1/√N` (N = node count) is used.
+    iterations : int
+        Number of optimisation steps for the spring layout.  Ignored by KK.
+
+    Returns
+    -------
+    dict[int, tuple[float, float]]
+        Mapping `node_id → (x, y)` suitable for `nx.draw_*` or PyVis.
+    """
+
+    # --- Fruchterman–Reingold (default) ----------------------------------
+    if layout == "spring":
+        # Heuristic: larger graphs need smaller k to avoid sprawling too far.
+        default_k = 2 / np.sqrt(max(G.number_of_nodes(), 1))
+        return nx.spring_layout(
+            G,
+            k=k or default_k,          # user‑defined k overrides heuristic
+            iterations=iterations,
+            seed=42,                   # deterministic result for reproducibility
+        )
+
+    # --- Kamada–Kawai -----------------------------------------------------
+    if layout == "kk":
+        # KK layout generally yields fewer edge crossings for small graphs.
+        return nx.kamada_kawai_layout(G)
+
+    # --- Invalid option ---------------------------------------------------
+    raise ValueError("layout must be 'spring' or 'kk'")
+# ============================================================================
+
+
+
+# ============================================================================
+# Utility functions for node colour and shape selection
+# ============================================================================
+#
+# These helpers decouple visual‑style decisions from the drawing code.  A caller
+# passes a monomer *label* (e.g. "monoA"), an *index* (order of first
+# appearance) and optional user overrides; the function returns a concrete value
+# understandable by Matplotlib (or PyVis for shapes).
+# -----------------------------------------------------------------------------
+
+
+def _color_for(label: str, idx: int, overrides: Dict[str, str]):
+    """Return an RGBA colour for *label*.
+
+    Parameters
+    ----------
+    label : str
+        Monomer type name (e.g. "monoA").
+    idx : int
+        Zero‑based ordinal of *label* in the unique type list—used only when no
+        override colour is given.
+    overrides : dict[str, str]
+        Mapping *label → colour* specified by the user.  Colours follow any
+        Matplotlib‑recognised format ("red", "#ff0000", "0.8 0.2 0.3", …).
+
+    Returns
+    -------
+    tuple | str
+        RGBA tuple suitable for `nx.draw_*` *or* the raw override string if one
+        was provided.
+    """
+    # 1) Use user‑defined colour if available ----------------------------
+    if label in overrides:
+        return overrides[label]
+
+    # 2) Otherwise pick the *idx*-th colour from the Set2 palette --------
+    rgba = plt.cm.get_cmap("Set2")(idx)
+    # Matplotlib returns (r, g, b, a); normalise to fully‑opaque RGBA tuple
+    return (rgba[0], rgba[1], rgba[2], 1.0)
+
+
+# -----------------------------------------------------------------------------
+# Shape lookup tables
+# -----------------------------------------------------------------------------
+# Mapping of human‑readable shape names to marker codes (Matplotlib) and shape
+# strings (PyVis). These keep the public API consistent even though the two
+# libraries expect different identifiers.
+# -----------------------------------------------------------------------------
+
+_ALLOWED_SHAPES = {
+    "circle": "o",
+    "square": "s",
+    "triangle": "^",
+    "diamond": "D",
+}
+
+_PYVIS_SHAPES = {
+    "circle": "dot",
+    "square": "box",
+    "triangle": "triangle",
+    "diamond": "diamond",
+}
+
+
+def _shape_for(
+        label: str, 
+        overrides: 
+        Dict[str, str]
+) -> None:
+    """Return a Matplotlib marker code for the given *label*.
+
+    Parameters
+    ----------
+    label : str
+        Monomer type name.
+    overrides : dict[str, str]
+        Mapping *label → shape_name* supplied by the user.
+
+    Notes
+    -----
+    * If *label* has an override, the corresponding marker from
+      `_ALLOWED_SHAPES` is returned.
+    * Unknown shape names in *overrides* fall back to "circle".
+    """
+    return _ALLOWED_SHAPES.get(overrides.get(label, "circle"), "o")
+
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Static PNG drawing with colour‑based node contraction *without* altering edge colours
+# ----------------------------------------------------------------------------
+
+__all__ = ["draw_static"]
+
+# -----------------------------------------------------------------------------
+#   Contraction helpers
+# -----------------------------------------------------------------------------
+
+def _build_rep_map_by_colour(
+        G: nx.Graph, 
+        colour_map: Dict[int, str]
+        ) -> Dict[int, int]:
+    """
+    Return a mapping *node → representative* where each connected component
+    composed solely of nodes sharing the same colour collapses to one rep.
+    """
+    rep_of: Dict[int, int] = {}
+    for col in set(colour_map.values()):
+        # Take nodes having same colur
+        nodes = [n for n, c in colour_map.items() if c == col]
+
+        for comp in nx.connected_components(G.subgraph(nodes)):
+            # nx.connected_components(G.subgraph(nodes))
+            #   Take the subgraph induced by those nodes and 
+            #   obtain its connected component
+
+            # choose the smallest node ID as the representative.
+            rep = min(comp)
+
+            # Map each node n in the component to its representative rep
+            for n in comp:
+                rep_of[n] = rep
+
+    return rep_of
+
+
+def _build_rep_map_by_label(
+        G: nx.Graph, 
+        label_map: Dict[int, str]
+) -> Dict[int, int]:
+    """
+    Same as above but grouping by identical *label*
+    """
+    rep_of: Dict[int, int] = {}
+    for lbl in set(label_map.values()):
+        nodes = [n for n, l in label_map.items() if l == lbl]
+        for comp in nx.connected_components(G.subgraph(nodes)):
+            rep = min(comp)
+            for n in comp:
+                rep_of[n] = rep
+    return rep_of
+
+
+def _contract_graph(
+    G: nx.Graph,
+    rep_of: Dict[int, int],        # original node ID → representative ID
+    mono_label: Dict[int, str],    # original node ID → monomer label
+) -> Tuple[nx.Graph, Dict[int, str]]:
+    """
+    Return a contracted graph *and* a label map for its super‑nodes.
+
+    Parameters
+    ----------
+    G
+        Original NetworkX graph whose nodes will be merged.
+    rep_of
+        Mapping that tells **which representative** each original node should
+        collapse into (produced e.g. by `_build_rep_map_by_label`).
+    mono_label
+        Original label for every node (used to pick a label for each rep).
+
+    Returns
+    -------
+    new_G
+        Graph that contains **only the representative nodes**.
+    new_label
+        Dict mapping each representative ID → chosen label (majority vote).
+    """
+
+    # ------------------------------------------------------------------
+    # Initialise the contracted graph and label container
+    # ------------------------------------------------------------------
+    new_G = nx.Graph()              # empty graph that will hold reps only
+    new_label: Dict[int, str] = {}  # rep ID → label chosen for that rep
+
+    # ------------------------------------------------------------------
+    # 1) Gather all labels belonging to the same representative
+    # ------------------------------------------------------------------
+    comp_labels: Dict[int, List[str]] = defaultdict(list)
+    for node, rep in rep_of.items():
+        comp_labels[rep].append(mono_label[node])
+
+    # ------------------------------------------------------------------
+    # 2) Decide a single label per representative (majority vote)
+    # ------------------------------------------------------------------
+    for rep, lbls in comp_labels.items():
+        # Count occurrences: [('A', 3), ('B', 1), ...] ordered by freq desc
+        common = Counter(lbls).most_common()
+        top_freq = common[0][1]                     # highest vote count
+        # Keep only labels with that top frequency; tie‑breaker = lexicographic
+        candidates = sorted(l for l, c in common if c == top_freq)
+        new_label[rep] = candidates[0]
+
+    # ------------------------------------------------------------------
+    # 3) Add representative nodes to the new graph
+    # ------------------------------------------------------------------
+    new_G.add_nodes_from(new_label.keys())
+
+    # ------------------------------------------------------------------
+    # 4) Recreate edges: map endpoints via rep_of and skip self‑loops
+    # ------------------------------------------------------------------
+    for u, v in G.edges():
+        ru, rv = rep_of[u], rep_of[v]  # representatives of each endpoint
+        if ru != rv:                   # ignore edges collapsing into a loop
+            new_G.add_edge(ru, rv)
+
+    # ------------------------------------------------------------------
+    # 5) Return the contracted artefacts
+    # ------------------------------------------------------------------
+    return new_G, new_label
+
+
+def _edge_colours_preserved(
+    G_old: nx.Graph,
+    G_new: nx.Graph,
+    rep_of: Dict[int, int],
+    mono_label_old: Dict[int, str],
+    edge_color_over: Dict[Tuple[str, str], str],
+    default_edge_color: str,
+) -> List[str]:
+    """
+    Compute edge colours for *G_new* based on the original labels/edges so
+    that **contraction does not change colour assignments**.
+    """
+    # Collect colours of original edges bucketed by (rep_u, rep_v) unordered
+    bucket: Dict[Tuple[int, int], str] = {}
+    for u, v in G_old.edges():
+        ru, rv = rep_of[u], rep_of[v]
+        if ru == rv:
+            continue
+        a, b = mono_label_old[u], mono_label_old[v]
+        colour = (
+            edge_color_over.get((a, b))
+            or edge_color_over.get((b, a))
+            or default_edge_color
+        )
+        key = (min(ru, rv), max(ru, rv))
+        # keep first encountered colour (all colours identical for these edges
+        # if edge_color_over deterministic)
+        bucket.setdefault(key, colour)
+
+    colours_new: List[str] = []
+    for u, v in G_new.edges():
+        key = (min(u, v), max(u, v))
+        colours_new.append(bucket.get(key, default_edge_color))
+    return colours_new
+
+
+
+# -----------------------------------------------------------------------------
+#   Main drawing function
+# -----------------------------------------------------------------------------
+
+
+
+def buid_draw_state(
+    G: nx.Graph,
+    mono_label: Dict[int, str],
+    color_over: Dict[str, str] | None = None,
+    shape_over: Dict[str, str] | None = None,
+    edge_color_over: Dict[Tuple[str, str], str] | None = None,
+    *,
+    contract: str | None = None,  # None | "label" | "color"
+    default_edge_color: str = "#666666",
+):
+    """
+    Draw graph, optionally contracting contiguous nodes **without changing
+    existing edge colours**.
+
+    ``contract="color"`` now *only* merges runs of identically coloured nodes;
+    edge colouring is **computed from the original graph** and preserved.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Connectivity graph; nodes are monomer instances, edges are bonds.
+    mono_label : dict[int, str]
+        Node ID → monomer label.
+    color_over : Dict[str, str]
+        Mapping *label → colour* specified by the user. 
+    shape_over : Dict[str, str]
+        Mapping *label → shape_name* supplied by the user.
+    edge_color_over : dict[(str, str), str] | None
+        Mapping ``(label_A, label_B) → colour``. Order is **not** significant;
+        ``(A, B)`` and ``(B, A)`` are treated the same. Missing pairs fall back
+        to *default_edge_color*.
+    contract: str
+        Merge contiguous nodes before drawing
+            'label' → merge runs of identical monomer labels;
+            'color' → merge runs that share the same final node colour.
+    default_edge_color : str
+        Colour used for edges without an explicit override.
+    out_png : Path | None
+        Path to save the PNG; *None* shows the figure interactively.
+    layout, k, iterations
+        Passed straight to :pyfunc:`_compute_layout`.
+    """
+
+    color_over = color_over or {}
+    shape_over = shape_over or {}
+    edge_color_over = edge_color_over or {}
+
+    # Determine base colour per node (before any contraction) -------------------
+    label_order = sorted(set(mono_label.values()))
+    node_colour_orig = {
+        n: _color_for(mono_label[n], label_order.index(mono_label[n]), color_over)
+        for n in G.nodes
+    }
+
+    # Decide contraction mapping ------------------------------------------------
+    rep_of: Optional[Dict[int, int]] = None
+    if contract == "label":
+        rep_of = _build_rep_map_by_label(G, mono_label)
+    elif contract == "color":
+        rep_of = _build_rep_map_by_colour(G, node_colour_orig)
+    elif contract is not None:
+        raise ValueError("contract must be None, 'label', or 'color'")
+
+    if rep_of is None:  
+        # no contraction --------------------------------------------------------
+        G_draw, mono_label_draw = G, mono_label
+        node_colour_draw = node_colour_orig
+        edge_colours_draw = [
+            (
+                edge_color_over.get((mono_label[u], mono_label[v]))
+                or edge_color_over.get((mono_label[v], mono_label[u]))
+                or default_edge_color
+            )
+            for u, v in G.edges()
+        ]
+    else:
+        # Build contracted graph & label map
+        G_draw, mono_label_draw = _contract_graph(G, rep_of, mono_label)
+
+        # Node colours after contraction: colour determined by first original node
+        node_colour_draw = {
+            rep: node_colour_orig[next(n for n in G.nodes if rep_of[n] == rep)]
+            for rep in G_draw.nodes
+        }
+
+        # Preserve edge colours
+        edge_colours_draw = _edge_colours_preserved(
+            G,
+            G_draw,
+            rep_of,
+            mono_label,
+            edge_color_over,
+            default_edge_color,
+        )
+    
+    return G_draw, mono_label_draw, node_colour_draw, edge_colours_draw
+    
+
+def draw_static(
+    G: nx.Graph,
+    mono_label_draw: Dict[int, str],
+    node_colour_draw: Dict[int, str | tuple[float, float, float, float]],
+    edge_colours_draw: list[str],
+    shape_over: Dict[str, str] | None = None,
+    *,
+    out_png: Optional[Path] = None,
+    layout: str = "spring",
+    k: float = 0.0,
+    iterations: int = 300,
+):
+    # ------------------------------ layout ----------------------------------
+    pos = _compute_layout(G, layout, k, iterations)
+
+    # ------------------------------ nodes -----------------------------------
+    shape_groups: Dict[str, List[int]] = {}
+    for n in G.nodes:
+        shp = _shape_for(mono_label_draw[n], shape_over)
+        shape_groups.setdefault(shp, []).append(n)
+
+    plt.figure(figsize=(6, 6), dpi=150)
+    for shp, nodes in shape_groups.items():
+        colours = [node_colour_draw[n] for n in nodes]
+        nx.draw_networkx_nodes(
+            G,
+            pos,
+            nodelist=nodes,
+            node_shape=shp,
+            node_color=colours,
+            node_size=100,
+            linewidths=0.8,
+        )
+
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        labels = {n: str(n) for n in G.nodes},
+        font_size=0,
+    )
+
+    # ------------------------------ edges ----------------------------------
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        width=1,
+        edge_color=edge_colours_draw,
+    )
+
+    plt.axis("off")
+    plt.tight_layout()
+
+    if out_png:
+        plt.savefig(out_png)
+        print(f"[polymer_graph] static image saved to {out_png}")
+    else:
+        plt.show()
+
+
+
+# ============================================================================
+# Interactive HTML via PyVis
+# ============================================================================
+
+
+def draw_interactive(
+    G: nx.Graph,
+    mono_label: Dict[int, str],
+    color_over: Dict[str, str],
+    shape_over: Dict[str, str],
+    html_path: Path,
+):
+    try:
+        from pyvis.network import Network
+    except ImportError:
+        print("[polymer_graph] PyVis not installed; skipping interactive output.")
+        return
+    try:
+        net = Network(height="750px", width="100%", bgcolor="#ffffff", notebook=False)
+        types = sorted(set(mono_label.values()))
+        for n in G.nodes:
+            label = mono_label[n]
+            col = _color_for(label, types.index(label), color_over)
+            if isinstance(col, tuple):
+                col = f"#{int(col[0]*255):02x}{int(col[1]*255):02x}{int(col[2]*255):02x}"
+            shape_key = shape_over.get(label, "circle")
+            shap = _PYVIS_SHAPES.get(shape_key, "dot")
+            net.add_node(n, label=f"{n} ({label})", color=col, shape=shap)
+        for u, v in G.edges():
+            net.add_edge(u, v)
+        net.write_html(str(html_path), notebook=False)
+        print(f"[polymer_graph] interactive HTML saved to {html_path}")
+    except Exception as e:
+        print(f"[polymer_graph] Failed to build interactive HTML: {e}")
+
+
+
+def _walk_branch_to_leaf(
+    G: nx.Graph,
+    deg0: Dict[int, int],
+    j: int,
+    nbr: int,
+    max_steps: int,
+) -> Tuple[List[int], Optional[int], bool]:
+    """
+    Walk straight from a junction j (deg >= 3) toward its neighbor `nbr` along a
+    chain of degree-2 nodes only, and determine whether you can reach a leaf
+    (degree == 1) without encountering another junction (degree >= 3).
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Undirected graph (polymer bonding graph). No self-loops or multiedges assumed.
+        This function evaluates only the single direction from j to nbr (no full search).
+    deg0 : Dict[int, int]
+        Snapshot of node degrees at call time, e.g., `deg0 = dict(G.degree())`.
+        In iterative pruning, recompute this every round after modifications.
+    j : int
+        Starting junction node (expected deg >= 3). We evaluate one outgoing direction.
+    nbr : int
+        A neighbor of `j`. We take the first step `j -> nbr` and then continue straight.
+        If `nbr` is already a leaf (deg == 1), success with distance 1.
+        If `nbr` is a junction (deg >= 3), this direction is not a branch → failure.
+    max_steps : int
+        Maximum allowed distance (number of edges). `j -> nbr` counts as 1 step.
+
+    Returns
+    -------
+    path : List[int]
+        Path nodes excluding `j`. On success: `[nbr, ..., leaf]` (leaf has deg == 1).
+        On failure, returns the partial path traversed so far (caller should check `reached_leaf`).
+    dist : Optional[int]
+        Number of edges from `j` to `leaf`. On success: 1..`max_steps`; on failure: None.
+    reached_leaf : bool
+        True if a leaf was reached; False otherwise.
+
+    Notes
+    -----
+    - This is a *branch* checker: it accepts only shapes like
+      junction → (degree-2 chain) → leaf. Hitting another junction en route is failure.
+    - In rings, encountering a junction (deg >= 3) causes failure for this direction.
+      If you also want to forbid re-entering `j`, see the commented alternative below.
+    - Time complexity is O(max_steps): we follow at most `max_steps` edges.
+    """
+
+    # Start the path at `nbr` (exclude `j` from the returned path)
+    path = [nbr]
+
+    # Track previous node (initially `j`) and current node (initially `nbr`)
+    prev = j
+    cur = nbr
+
+    # Distance in number of edges; the first step j -> nbr counts as 1
+    steps = 1
+
+    # --- Immediate check 1: `nbr` is already a leaf → success with distance 1
+    if deg0[cur] == 1:
+        return path, steps, True
+
+    # --- Immediate check 2: `nbr` is a junction → not a branch, fail
+    if deg0[cur] >= 3:
+        return path, None, False
+
+    # From here, `cur` should have degree 2: continue straight until leaf or limit
+    while steps < max_steps:
+        # Choose the next node excluding the node we came from (`prev`)
+        nxts = [x for x in G.neighbors(cur) if x not in {prev, j}]
+        # If you also want to avoid stepping back into `j`, use:
+
+        # Unexpected shape: no valid next hop (disconnected/inconsistent) → fail
+        if not nxts:
+            return path, None, False
+
+        # In a degree-2 chain, the next hop is unique; take the first
+        nxt = nxts[0]
+
+        # Advance one step
+        path.append(nxt)
+        steps += 1
+        prev, cur = cur, nxt
+
+        # --- Check A: reached a leaf → success
+        if deg0[cur] == 1:
+            return path, steps, True
+
+        # --- Check B: hit another junction → not a branch, fail
+        if deg0[cur] >= 3:
+            return path, None, False
+
+        # Otherwise deg == 2 → keep going
+
+    # Reached `max_steps` without finding a leaf → treat as failure
+    return path, None, False
+
+
+def _collect_candidates(
+    G: nx.Graph,
+    degree_threshold: int,
+    max_distance: int,
+) -> List[Tuple[int, int, List[int]]]:
+    """
+    候補枝を収集。返り値: [(dist, junction, path_nodes=[nbr,...,leaf]), ...]
+    dist は max_distance 以下のもののみ。
+    """
+    deg0 = dict(G.degree())
+    junctions = [n for n, d in deg0.items() if d >= degree_threshold]
+    cands: List[Tuple[int, int, List[int]]] = []
+    for j in junctions:
+        for nbr in G.neighbors(j):
+            path, dist, reached = _walk_branch_to_leaf(G, deg0, j, nbr, max_distance)
+            if reached and dist is not None and dist <= max_distance:
+                cands.append((dist, j, path))
+    return cands
+
+
+def _choose_one(
+    candidates: List[Tuple[int, int, List[int]]],
+    tie_break: str = "lex",  # "lex"（距離→長さ→junction id→pathの辞書順）/ "random"
+) -> Optional[Tuple[int, int, List[int]]]:
+    if not candidates:
+        return None
+    if tie_break == "random":
+        import random
+        return random.choice(candidates)
+    # 決定的に1本選ぶ：距離→パス長→junction id→パス内容(辞書順)
+    return min(
+        candidates,
+        key=lambda x: (x[0], len(x[2]), x[1], tuple(x[2]))
+    )
+
+
+def prune_one_shortest_branch_once(
+    G: nx.Graph,
+    degree_threshold: int = 3,
+    max_distance: int = 3,
+    tie_break: str = "lex",
+    keep_junctions: bool = True,  # 将来の拡張用（現仕様では常にTrue想定）
+):
+    """
+    現在のグラフで「最短の葉への枝」を“1本だけ”削除して返す。
+    見つからなければ (G, set(), None) を返す。
+    info: {"junction": j, "dist": d, "path": [nbr,...,leaf]}
+    """
+    cands = _collect_candidates(G, degree_threshold, max_distance)
+    chosen = _choose_one(cands, tie_break=tie_break)
+    if chosen is None:
+        return G, set(), None
+
+    dist, j, path = chosen
+    # 分岐点 j は削除しない。path だけ削除。
+    H = G.copy()
+    H.remove_nodes_from(path)
+    return H, set(path), {"junction": j, "dist": dist, "path": path}
+
+
+def prune_shortest_branch_iter(
+    G: nx.Graph,
+    degree_threshold: int = 3,
+    max_distance: int = 3,
+    tie_break: str = "lex",
+    max_rounds: int = 10000,
+):
+    """
+    「最短枝を1本だけ削除」を該当がなくなるまで繰り返す。
+    戻り値:
+      H: 収束後グラフ
+      removed_total: 全ラウンドで削除したノード集合
+      rounds_info: [{"round": r, "junction": j, "dist": d, "path": [...]} ...]
+    """
+    H = G.copy()
+    removed_total: Set[int] = set()
+    rounds_info: List[Dict[str, object]] = []
+
+    for r in range(1, max_rounds + 1):
+        H_new, removed, info = prune_one_shortest_branch_once(
+            H,
+            degree_threshold=degree_threshold,
+            max_distance=max_distance,
+            tie_break=tie_break,
+        )
+        if not removed:
+            break
+        H = H_new
+        removed_total |= removed
+        rounds_info.append({"round": r, **info})
+
+    return H, removed_total, rounds_info
+
+
+
+# ============================================================================
+# CLI parser
+# ============================================================================
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Monomer connectivity graph visualizer")
+    
+    p.add_argument(
+        "--polymer_mol", 
+        type = str,
+        help="MOL file path"
+        )
+    
+    p.add_argument(
+        "--smiles",
+        nargs=2,
+        action="append",
+        metavar=("NAME", "SMARTS"),
+        required=True,
+        help="Repeatable monomer SMARTS patterns",
+    )
+    
+    p.add_argument(
+        "--color", 
+        nargs=2, 
+        action="append", 
+        metavar=("NAME", "COLOR"), 
+        help="Override node color"
+    )
+
+    p.add_argument(
+        "--shape",
+        nargs=2,
+        action="append",
+        metavar=("NAME", "SHAPE"),
+        help="Override node shape (circle|square|triangle|diamond)",
+    )
+
+    p.add_argument(
+        "--contract",
+        choices=["label", "color"],
+        default=None,        
+        help=(
+            "Merge contiguous nodes before drawing.  "
+            "'label' → merge runs of identical monomer labels;  "
+            "'color' → merge runs that share the same final node colour.  "
+            "Edge colours remain unchanged."
+        ),
+    )
+
+    p.add_argument(
+        "--edge_color",
+        nargs=3,
+        action="append",
+        metavar=("LABEL1", "LABEL2", "COLOR"),
+        help="Set edge colour between LABEL1 and LABEL2"
+    )
+
+    p.add_argument(
+        "-o", 
+        "--out", 
+        type=Path, 
+        help="Static PNG output path"
+    )
+    
+    p.add_argument(
+        "--layout", 
+        choices=["spring", "kk"], 
+        default="spring", 
+        help="Layout algorithm"
+    )
+
+    p.add_argument(
+        "--k", 
+        type=float, 
+        default=0.0, 
+        help="spring_layout k parameter (0=auto)"
+    )
+
+    p.add_argument(
+        "--iter", 
+        type=int, 
+        default=300, 
+        help="spring_layout iterations"
+    )
+
+    p.add_argument(
+        "--interactive", 
+        type=Path, 
+        help="HTML output for interactive graph"
+    )
+
+    return p
+
+# ============================================================================
+
+
+
+# ============================================================================
+# Run entry
+# ============================================================================
+# Create and return an argparse.ArgumentParser pre‑configured for the
+# *Monomer Connectivity Graph Visualiser* command‑line interface.
+# -----------------------------------------------------------------------------
+
+def run(argv: Optional[List[str]] = None):
+    
+    argv = sys.argv[1:] if argv is None else argv
+    # auto --out if last arg is *.png and out flag not given
+    if argv and not any(a in {"-o", "--out"} for a in argv) and re.search(r"\.png$", argv[-1], re.I):
+        argv = argv[:-1] + ["--out", argv[-1]]
+
+    args = _parser().parse_args(argv)
+
+    # Prepare overrides
+    patterns = {n: s for n, s in args.smiles}
+    color_over = {n: c for n, c in (args.color or [])}
+    shape_over = {n: s for n, s in (args.shape or [])}
+    edge_over_color = {(lb1, lb2): cl for lb1, lb2, cl in (args.edge_color or [])}
+
+    # Validate shapes
+    for lab, shp in shape_over.items():
+        if shp not in _ALLOWED_SHAPES:
+            raise ValueError(
+                f"Unknown shape '{shp}' for monomer '{lab}'. \
+                Allowed: {list(_ALLOWED_SHAPES)}"
+                )
+
+    # Build graph ------------------------------------------------------------
+    # Mol object in which the full reacted polymer/network structure is represented
+    mol = _load_polymer(args.polymer_mol)
+    
+    atom2mono, mono_label = enumerate_monomers(mol, patterns)
+    G = build_graph(mol, atom2mono, mono_label)
+
+    print(f"Detected {G.number_of_nodes()} monomer units, {G.number_of_edges()} edges.")
+
+    G_draw, mono_label_draw, node_colour_draw, edge_colours_draw = buid_draw_state(
+    G,
+    mono_label,
+    color_over,
+    shape_over,
+    edge_over_color,
+    contract = args.contract,
+    )
+
+    draw_static(
+        G_draw,
+        mono_label_draw,
+        node_colour_draw,
+        edge_colours_draw,
+        shape_over,
+        out_png = args.out, 
+        layout = args.layout, 
+        k = args.k, 
+        iterations = args.iter
+    )
+    
+    if args.interactive:
+        draw_interactive(G, mono_label, color_over, shape_over, args.interactive)
+    
+    debug_remove = True
+    if debug_remove:
+        H, removed_total, rounds = prune_shortest_branch_iter(
+            G, degree_threshold=3, max_distance=2, tie_break="lex"
+            )
+        draw_static(
+        H,
+        mono_label_draw,
+        node_colour_draw,
+        edge_colours_draw,
+        shape_over,
+        out_png = 'test.png', 
+        layout = args.layout, 
+        k = args.k, 
+        iterations = args.iter
+        )
+    return G_draw
+
+# ============================================================================
+
+
+
+if __name__ == "__main__":
+    run()
